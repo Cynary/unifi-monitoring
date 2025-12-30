@@ -31,3 +31,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+
+# Added by cargo
+
+/target
+tests/fixtures/

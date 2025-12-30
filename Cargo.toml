@@ -1,0 +1,76 @@
+[package]
+name = "unifi-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "cookies", "rustls-tls"], default-features = false }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+native-tls = "0.2"
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Compression (for Protect binary protocol)
+flate2 = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Environment
+dotenvy = "0.15"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL handling
+url = "2"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# Ctrl+C handling for test binaries
+ctrlc = "3"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
+
+# Web server
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"
+insta = { version = "1", features = ["json"] }
+
+[[bin]]
+name = "unifi-monitor"
+path = "src/main.rs"
+
+[[bin]]
+name = "test-unifi-auth"
+path = "src/bin/test_unifi_auth.rs"
+
+[[bin]]
+name = "test-unifi-events"
+path = "src/bin/test_unifi_events.rs"
+
+[[bin]]
+name = "fetch-historical-events"
+path = "src/bin/fetch_historical_events.rs"
