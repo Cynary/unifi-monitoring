@@ -351,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
             created_at: chrono::Utc::now().timestamp(),
         });
 
-        println!(
+        tracing::debug!(
             "[{}] {} {} | {} | {} [{}]",
             count,
             ts,
