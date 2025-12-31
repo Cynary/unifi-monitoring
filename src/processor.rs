@@ -1,6 +1,5 @@
 //! Event processor - stores events and queues notifications
 
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 

@@ -53,9 +53,10 @@ pub struct UnifiClient {
     session: Arc<UnifiSession>,
     event_rx: mpsc::Receiver<UnifiEvent>,
     handles: Vec<JoinHandle<()>>,
-    seen_events: SeenEvents,
-    state_tracker: StateTracker,
-    db: Option<Database>,
+    // These fields are cloned and passed to spawned tasks; kept here for ownership
+    _seen_events: SeenEvents,
+    _state_tracker: StateTracker,
+    _db: Option<Database>,
 }
 
 impl UnifiClient {
@@ -220,9 +221,9 @@ impl UnifiClient {
             session,
             event_rx,
             handles,
-            seen_events,
-            state_tracker,
-            db,
+            _seen_events: seen_events,
+            _state_tracker: state_tracker,
+            _db: db,
         })
     }
 

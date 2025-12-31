@@ -244,7 +244,6 @@ pub async fn start_server(state: AppState, addr: &str, static_dir: Option<&str>)
 /// Start the web server with authentication
 pub async fn start_server_with_auth(state: FullAppState, addr: &str, static_dir: Option<&str>) -> anyhow::Result<()> {
     use std::net::SocketAddr;
-    use axum::extract::connect_info::ConnectInfo;
 
     let router = create_router_with_auth(state, static_dir);
     let listener = tokio::net::TcpListener::bind(addr).await?;

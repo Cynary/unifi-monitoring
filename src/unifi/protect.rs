@@ -37,8 +37,6 @@ const PACKET_TYPE_ACTION: u8 = 1;
 const PACKET_TYPE_PAYLOAD: u8 = 2;
 
 const FORMAT_JSON: u8 = 1;
-const FORMAT_UTF8: u8 = 2;
-const FORMAT_BUFFER: u8 = 3;
 
 /// Action frame from Protect WebSocket
 #[derive(Debug, Deserialize)]
@@ -277,7 +275,7 @@ fn parse_protect_packet(data: &[u8]) -> Result<Option<(UnifiEvent, String, Strin
     Ok(Some((event, action_type, entity_id, data_json, new_update_id)))
 }
 
-fn decompress_if_needed(data: &[u8], compressed: bool, format: u8) -> Result<Vec<u8>, UnifiError> {
+fn decompress_if_needed(data: &[u8], compressed: bool, _format: u8) -> Result<Vec<u8>, UnifiError> {
     if !compressed {
         return Ok(data.to_vec());
     }

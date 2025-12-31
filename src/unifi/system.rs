@@ -12,7 +12,7 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
     Connector,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use super::auth::UnifiSession;
 use super::client::{state_changed, SeenEvents, StateTracker};

@@ -16,7 +16,7 @@ use tokio_tungstenite::{
     },
     Connector,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use super::auth::UnifiSession;
 use super::client::{state_changed, SeenEvents, StateTracker};
