@@ -7,7 +7,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use unifi_monitor::db::{Classification, Database};
 use unifi_monitor::processor::{EventProcessor, NotificationSender, ProcessorConfig};
 use unifi_monitor::unifi::{UnifiClient, UnifiConfig};
-use unifi_monitor::web::{self, auth::AuthState, FullAppState, SseEvent};
+use unifi_monitor::web::{self, auth::AuthState, FullAppState, SseEvent, TelegramConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -176,10 +176,20 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("==================================================");
     }
 
+    // Build telegram config if both token and chat_id are set
+    let telegram_config = match (&telegram_token, &telegram_chat_id) {
+        (Some(token), Some(chat_id)) => Some(TelegramConfig {
+            token: token.clone(),
+            chat_id: chat_id.clone(),
+        }),
+        _ => None,
+    };
+
     let web_state = FullAppState {
         db: db.clone(),
         sse_tx: sse_tx.clone(),
         auth: auth_state,
+        telegram: telegram_config,
     };
     tokio::spawn(async move {
         if let Err(e) = web::start_server_with_auth(web_state, &listen_addr, static_dir.as_deref()).await {

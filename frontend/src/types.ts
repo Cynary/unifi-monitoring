@@ -54,3 +54,23 @@ export interface InviteToken {
   token: string;
   expires_in_secs: number;
 }
+
+// Notification types
+export interface NotificationLogEntry {
+  id: number;
+  event_id: string | null;
+  event_type: string | null;
+  event_summary: string | null;
+  status: 'sent' | 'failed';
+  error_message: string | null;
+  created_at: number;
+}
+
+export interface NotificationStatus {
+  configured: boolean;
+}
+
+export interface TestNotificationResult {
+  success: boolean;
+  error: string | null;
+}

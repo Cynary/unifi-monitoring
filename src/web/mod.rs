@@ -50,12 +50,20 @@ pub struct AppState {
     pub sse_tx: broadcast::Sender<SseEvent>,
 }
 
+/// Telegram configuration
+#[derive(Clone)]
+pub struct TelegramConfig {
+    pub token: String,
+    pub chat_id: String,
+}
+
 /// Full application state with auth
 #[derive(Clone)]
 pub struct FullAppState {
     pub db: Database,
     pub sse_tx: broadcast::Sender<SseEvent>,
     pub auth: AuthState,
+    pub telegram: Option<TelegramConfig>,
 }
 
 /// Create the web server router (legacy - no auth)
@@ -198,6 +206,10 @@ pub fn create_router_with_auth(state: FullAppState, static_dir: Option<&str>) ->
         .route("/api/rules/{event_type}", delete(delete_rule))
         // Stats
         .route("/api/stats", get(get_stats))
+        // Notifications API
+        .route("/api/notifications/history", get(get_notification_history))
+        .route("/api/notifications/test", post(send_test_notification))
+        .route("/api/notifications/status", get(get_notification_status))
         .with_state(full_state.clone());
 
     // Public routes (no auth required)
@@ -667,6 +679,95 @@ fn get_stats_impl(db: &Database) -> Result<Json<StatsResponse>, AppError> {
         notify_types,
         ignored_types,
     }))
+}
+
+// ============================================================================
+// Notifications API
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct NotificationLogResponse {
+    pub id: i64,
+    pub event_id: Option<String>,
+    pub event_type: Option<String>,
+    pub event_summary: Option<String>,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NotificationHistoryQuery {
+    limit: Option<usize>,
+}
+
+async fn get_notification_history(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+    Query(query): Query<NotificationHistoryQuery>,
+) -> Result<Json<Vec<NotificationLogResponse>>, AppError> {
+    require_auth(&jar, &state.db)?;
+
+    let limit = query.limit.unwrap_or(50);
+    let history = state.db.get_notification_history(limit)?;
+
+    let response: Vec<NotificationLogResponse> = history
+        .into_iter()
+        .map(|entry| NotificationLogResponse {
+            id: entry.id,
+            event_id: entry.event_id,
+            event_type: entry.event_type,
+            event_summary: entry.event_summary,
+            status: entry.status,
+            error_message: entry.error_message,
+            created_at: entry.created_at,
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
+#[derive(Debug, Serialize)]
+pub struct NotificationStatusResponse {
+    pub configured: bool,
+}
+
+async fn get_notification_status(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+) -> Result<Json<NotificationStatusResponse>, AppError> {
+    require_auth(&jar, &state.db)?;
+
+    Ok(Json(NotificationStatusResponse {
+        configured: state.telegram.is_some(),
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct TestNotificationResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+async fn send_test_notification(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+) -> Result<Json<TestNotificationResponse>, AppError> {
+    require_auth(&jar, &state.db)?;
+
+    let telegram = state.telegram.as_ref()
+        .ok_or_else(|| AppError::BadRequest("Telegram not configured".to_string()))?;
+
+    match crate::processor::send_test_notification(&state.db, &telegram.token, &telegram.chat_id).await {
+        Ok(()) => Ok(Json(TestNotificationResponse {
+            success: true,
+            error: None,
+        })),
+        Err(e) => Ok(Json(TestNotificationResponse {
+            success: false,
+            error: Some(e.to_string()),
+        })),
+    }
 }
 
 // ============================================================================

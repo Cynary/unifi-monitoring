@@ -177,9 +177,18 @@ impl NotificationSender {
 
             match self.try_send_telegram(&event).await {
                 Ok(()) => {
-                    // Success - mark as notified
+                    // Success - mark as notified and log
                     if let Err(e) = self.db.mark_notified(&event.id) {
                         error!(id = event.id, error = %e, "Failed to mark event as notified");
+                    }
+                    if let Err(e) = self.db.log_notification(
+                        Some(&event.id),
+                        Some(&event.event_type),
+                        Some(&event.summary),
+                        "sent",
+                        None,
+                    ) {
+                        error!(error = %e, "Failed to log notification");
                     }
                     info!(
                         id = event.id,
@@ -189,6 +198,7 @@ impl NotificationSender {
                     return;
                 }
                 Err(e) => {
+                    let error_msg = e.to_string();
                     warn!(
                         id = event.id,
                         attempt = attempts,
@@ -202,6 +212,16 @@ impl NotificationSender {
                     }
 
                     if attempts >= self.max_attempts {
+                        // Log final failure
+                        if let Err(log_err) = self.db.log_notification(
+                            Some(&event.id),
+                            Some(&event.event_type),
+                            Some(&event.summary),
+                            "failed",
+                            Some(&error_msg),
+                        ) {
+                            error!(error = %log_err, "Failed to log notification failure");
+                        }
                         error!(
                             id = event.id,
                             attempts,
@@ -254,6 +274,52 @@ impl NotificationSender {
 
         Ok(())
     }
+}
+
+/// Send a test notification to Telegram
+pub async fn send_test_notification(
+    db: &Database,
+    telegram_token: &str,
+    telegram_chat_id: &str,
+) -> Result<(), TelegramError> {
+    let message = "🧪 *Test Notification*\n\nThis is a test message from UniFi Monitor\\. If you see this, your Telegram integration is working correctly\\!";
+
+    let url = format!(
+        "https://api.telegram.org/bot{}/sendMessage",
+        telegram_token
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "chat_id": telegram_chat_id,
+            "text": message,
+            "parse_mode": "MarkdownV2"
+        }))
+        .send()
+        .await
+        .map_err(|e| TelegramError::Request(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let error_msg = format!("{}: {}", status, body);
+
+        // Log failure
+        if let Err(e) = db.log_notification(None, None, Some("Test notification"), "failed", Some(&error_msg)) {
+            error!(error = %e, "Failed to log test notification failure");
+        }
+
+        return Err(TelegramError::Api(error_msg));
+    }
+
+    // Log success
+    if let Err(e) = db.log_notification(None, None, Some("Test notification"), "sent", None) {
+        error!(error = %e, "Failed to log test notification");
+    }
+
+    Ok(())
 }
 
 /// Escape special characters for Telegram MarkdownV2

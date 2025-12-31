@@ -1,4 +1,4 @@
-import type { Event, EventTypeSummary, Rule, Stats, Classification, Filters, AuthStatus, PasskeyInfo, InviteToken } from './types';
+import type { Event, EventTypeSummary, Rule, Stats, Classification, Filters, AuthStatus, PasskeyInfo, InviteToken, NotificationLogEntry, NotificationStatus, TestNotificationResult } from './types';
 
 const API_BASE = '/api';
 
@@ -295,4 +295,28 @@ export function prepareRequestOptions(
       id: base64UrlToArrayBuffer(cred.id as unknown as string),
     })),
   };
+}
+
+// ============================================================================
+// Notifications API
+// ============================================================================
+
+export async function fetchNotificationStatus(): Promise<NotificationStatus> {
+  const res = await fetch(`${API_BASE}/notifications/status`);
+  if (!res.ok) throw new Error(`Failed to fetch notification status: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchNotificationHistory(limit: number = 50): Promise<NotificationLogEntry[]> {
+  const res = await fetch(`${API_BASE}/notifications/history?limit=${limit}`);
+  if (!res.ok) throw new Error(`Failed to fetch notification history: ${res.status}`);
+  return res.json();
+}
+
+export async function sendTestNotification(): Promise<TestNotificationResult> {
+  const res = await fetch(`${API_BASE}/notifications/test`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`Failed to send test notification: ${res.status}`);
+  return res.json();
 }

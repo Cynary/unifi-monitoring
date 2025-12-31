@@ -150,6 +150,18 @@ impl Database {
                 expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
+
+            -- Notification log (tracks all sent/failed notifications)
+            CREATE TABLE IF NOT EXISTS notification_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT,
+                event_type TEXT,
+                event_summary TEXT,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_notification_log_created ON notification_log(created_at DESC);
             "#,
         )?;
 
@@ -873,6 +885,73 @@ impl Database {
         let rows = conn.execute("DELETE FROM invite_tokens WHERE expires_at <= ?1", params![now])?;
         Ok(rows)
     }
+
+    // ==================== Notification Log Methods ====================
+
+    /// Log a notification attempt
+    pub fn log_notification(
+        &self,
+        event_id: Option<&str>,
+        event_type: Option<&str>,
+        event_summary: Option<&str>,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            r#"
+            INSERT INTO notification_log (event_id, event_type, event_summary, status, error_message, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![event_id, event_type, event_summary, status, error_message, now],
+        )?;
+        Ok(())
+    }
+
+    /// Get notification history (most recent first)
+    pub fn get_notification_history(&self, limit: usize) -> rusqlite::Result<Vec<NotificationLogEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, event_id, event_type, event_summary, status, error_message, created_at
+            FROM notification_log
+            ORDER BY created_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(NotificationLogEntry {
+                id: row.get(0)?,
+                event_id: row.get(1)?,
+                event_type: row.get(2)?,
+                event_summary: row.get(3)?,
+                status: row.get(4)?,
+                error_message: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+
+        rows.collect()
+    }
+
+    /// Clean up old notification logs (keep last N entries)
+    pub fn cleanup_notification_logs(&self, keep_count: usize) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            r#"
+            DELETE FROM notification_log WHERE id NOT IN (
+                SELECT id FROM notification_log ORDER BY created_at DESC LIMIT ?1
+            )
+            "#,
+            params![keep_count as i64],
+        )?;
+        if rows > 0 {
+            debug!(deleted = rows, "Cleaned up old notification logs");
+        }
+        Ok(rows)
+    }
 }
 
 /// Passkey info for UI display
@@ -880,6 +959,18 @@ impl Database {
 pub struct PasskeyInfo {
     pub id: String,
     pub name: Option<String>,
+    pub created_at: i64,
+}
+
+/// Notification log entry
+#[derive(Debug, Clone)]
+pub struct NotificationLogEntry {
+    pub id: i64,
+    pub event_id: Option<String>,
+    pub event_type: Option<String>,
+    pub event_summary: Option<String>,
+    pub status: String,
+    pub error_message: Option<String>,
     pub created_at: i64,
 }
 

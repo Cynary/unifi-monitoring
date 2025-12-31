@@ -6,11 +6,15 @@ import { FilterBar } from './components/FilterBar';
 import { EventList } from './components/EventList';
 import { Login } from './components/Login';
 import { AccountMenu } from './components/AccountMenu';
+import { useTheme } from './hooks/useTheme';
 import './App.css';
 
 const EVENTS_PER_PAGE = 200;
 
 function App() {
+  // Theme
+  const { theme, toggleTheme } = useTheme();
+
   // Auth state
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -252,7 +256,7 @@ function App() {
               {stats.unclassified} unclassified types
             </span>
           )}
-          <AccountMenu onLogout={handleLogout} />
+          <AccountMenu onLogout={handleLogout} theme={theme} onToggleTheme={toggleTheme} />
         </div>
       </header>
 

@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 
 # Frontend
 /frontend/node_modules/
@@ -32,8 +31,5 @@ Thumbs.db
 # Logs
 *.log
 
-
-# Added by cargo
-
-/target
+# Test fixtures (may contain sensitive data)
 tests/fixtures/

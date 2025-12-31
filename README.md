@@ -1,15 +1,16 @@
 # UniFi Monitor
 
-A self-hosted event monitoring system for UniFi devices. Collects events from UniFi Protect, Network, and System APIs, classifies them, and sends Telegram notifications for events you care about.
+A self-hosted event monitoring system for UniFi devices. Collects events from UniFi Protect, Network, and System APIs, classifies them, and optionally sends Telegram notifications.
 
 ## Features
 
-- **Unified Event Collection**: Connects to all three UniFi websockets (Protect, Network, System) for comprehensive monitoring
-- **Smart Classification**: Three-state system (Ignored / Unclassified / Notify) with persistent rules
-- **Telegram Notifications**: At-least-once delivery with retry queue
-- **Web UI**: Browse events, classify event types, search with fuzzy matching and regex
-- **Passkey Authentication**: Passwordless, phishing-resistant auth with multi-device support
-- **Self-Hosted**: Single Docker container, runs on TrueNAS Scale or any Docker host
+- **Unified Event Collection** - Connects to all three UniFi websockets (Protect, Network, System)
+- **Smart Classification** - Three-state system (Ignored / Unclassified / Notify) with persistent rules
+- **Telegram Notifications** - Optional, at-least-once delivery with retry queue
+- **Web UI** - Browse events, classify event types, full-text search
+- **Passkey Authentication** - Passwordless, phishing-resistant auth (WebAuthn)
+- **Self-Hosted** - Single Docker container (~30MB), runs on TrueNAS Scale or any Docker host
+- **Light/Dark Theme** - Respects system preference, manually toggleable
 
 ## Quick Start
 
@@ -17,22 +18,15 @@ A self-hosted event monitoring system for UniFi devices. Collects events from Un
 
 - UniFi Dream Machine (UDM/UDM Pro/UDM SE) or similar UniFi OS device
 - Docker host (TrueNAS Scale, Synology, etc.)
-- Telegram account (for notifications)
+- Telegram account (optional, for notifications)
 
-### 1. Create a Telegram Bot
-
-1. Message [@BotFather](https://t.me/botfather) on Telegram
-2. Send `/newbot` and follow prompts
-3. Save the bot token
-4. Message your new bot, then get your chat ID from [@userinfobot](https://t.me/userinfobot)
-
-### 2. Create UniFi Local User
+### 1. Create UniFi Local User
 
 1. Log into your UniFi console
-2. Go to Settings > Admins & Users
-3. Create a local admin account (SSO accounts are not supported)
+2. Go to Settings → Admins & Users
+3. Create a local admin account (SSO accounts won't work)
 
-### 3. Deploy
+### 2. Deploy
 
 ```bash
 docker run -d \
@@ -40,18 +34,30 @@ docker run -d \
   -p 8080:8080 \
   -v /path/to/data:/data \
   -e UNIFI_HOST=192.168.1.1 \
-  -e UNIFI_USERNAME=api-user \
+  -e UNIFI_USERNAME=your-admin \
   -e UNIFI_PASSWORD=your-password \
-  -e TELEGRAM_BOT_TOKEN=123456:ABC... \
-  -e TELEGRAM_CHAT_ID=your-id \
   ghcr.io/cynary/unifi-monitor:latest
 ```
 
-### 4. Initial Setup
+### 3. Initial Setup
 
 1. Check logs for setup token: `docker logs unifi-monitor`
 2. Open http://your-host:8080
 3. Enter setup token and register your passkey
+
+### 4. Telegram Notifications (Optional)
+
+To receive notifications for events classified as "Notify":
+
+1. Message [@BotFather](https://t.me/botfather) on Telegram
+2. Send `/newbot` and follow prompts to create a bot
+3. Save the bot token
+4. Start a chat with your bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` to find your chat ID
+5. Add to your docker run command:
+   ```bash
+   -e TELEGRAM_BOT_TOKEN=your-token \
+   -e TELEGRAM_CHAT_ID=your-chat-id
+   ```
 
 ## Configuration
 
@@ -60,8 +66,8 @@ docker run -d \
 | `UNIFI_HOST` | Yes | - | UniFi console IP/hostname |
 | `UNIFI_USERNAME` | Yes | - | Local admin username |
 | `UNIFI_PASSWORD` | Yes | - | Local admin password |
-| `TELEGRAM_BOT_TOKEN` | Yes | - | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | Yes | - | Your Telegram user ID |
+| `TELEGRAM_BOT_TOKEN` | No | - | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | No | - | Your Telegram chat ID |
 | `DATABASE_PATH` | No | `/data/unifi-monitor.db` | SQLite database path |
 | `SETUP_TOKEN_PATH` | No | `/data/setup-token.txt` | Initial setup token file |
 | `LISTEN_ADDR` | No | `0.0.0.0:8080` | HTTP listen address |

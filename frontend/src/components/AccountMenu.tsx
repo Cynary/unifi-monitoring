@@ -1,28 +1,43 @@
 import { useState, useCallback } from 'react';
-import type { PasskeyInfo, InviteToken } from '../types';
-import { fetchPasskeys, deletePasskey, createInviteToken, logout } from '../api';
+import type { PasskeyInfo, InviteToken, NotificationLogEntry, NotificationStatus } from '../types';
+import { fetchPasskeys, deletePasskey, createInviteToken, logout, fetchNotificationStatus, fetchNotificationHistory, sendTestNotification } from '../api';
 
 interface AccountMenuProps {
   onLogout: () => void;
+  theme: 'light' | 'dark';
+  onToggleTheme: () => void;
 }
 
-export function AccountMenu({ onLogout }: AccountMenuProps) {
+export function AccountMenu({ onLogout, theme, onToggleTheme }: AccountMenuProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [passkeys, setPasskeys] = useState<PasskeyInfo[]>([]);
   const [inviteToken, setInviteToken] = useState<InviteToken | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Load passkeys when menu opens
+  // Notification state
+  const [notificationStatus, setNotificationStatus] = useState<NotificationStatus | null>(null);
+  const [notificationHistory, setNotificationHistory] = useState<NotificationLogEntry[]>([]);
+  const [isSendingTest, setIsSendingTest] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; error?: string } | null>(null);
+
+  // Load data when menu opens
   const handleToggle = useCallback(async () => {
     if (!isOpen) {
       setIsLoading(true);
       setError(null);
+      setTestResult(null);
       try {
-        const data = await fetchPasskeys();
-        setPasskeys(data);
+        const [passkeysData, notifStatus, notifHistory] = await Promise.all([
+          fetchPasskeys(),
+          fetchNotificationStatus(),
+          fetchNotificationHistory(10),
+        ]);
+        setPasskeys(passkeysData);
+        setNotificationStatus(notifStatus);
+        setNotificationHistory(notifHistory);
       } catch (err) {
-        setError('Failed to load passkeys');
+        setError('Failed to load account data');
       } finally {
         setIsLoading(false);
       }
@@ -64,14 +79,36 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
       onLogout();
     } catch (err) {
       console.error('Logout failed:', err);
-      // Still clear local state
       onLogout();
     }
   }, [onLogout]);
 
+  // Send test notification
+  const handleTestNotification = useCallback(async () => {
+    setIsSendingTest(true);
+    setTestResult(null);
+    setError(null);
+    try {
+      const result = await sendTestNotification();
+      setTestResult({ success: result.success, error: result.error || undefined });
+      // Refresh history after test
+      const history = await fetchNotificationHistory(10);
+      setNotificationHistory(history);
+    } catch (err) {
+      setTestResult({ success: false, error: 'Failed to send test notification' });
+    } finally {
+      setIsSendingTest(false);
+    }
+  }, []);
+
   // Format date
   const formatDate = (timestamp: number) => {
     return new Date(timestamp * 1000).toLocaleDateString();
+  };
+
+  // Format datetime for notifications
+  const formatDateTime = (timestamp: number) => {
+    return new Date(timestamp * 1000).toLocaleString();
   };
 
   return (
@@ -82,6 +119,61 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
 
       {isOpen && (
         <div className="account-dropdown">
+          {/* Telegram Notifications Section */}
+          <div className="account-section">
+            <h3>Telegram Notifications</h3>
+            {isLoading ? (
+              <p className="account-loading">Loading...</p>
+            ) : notificationStatus?.configured ? (
+              <>
+                <div className="notification-test">
+                  <button
+                    className="test-notification-btn"
+                    onClick={handleTestNotification}
+                    disabled={isSendingTest}
+                  >
+                    {isSendingTest ? 'Sending...' : 'Send Test Notification'}
+                  </button>
+                  {testResult && (
+                    <span className={`test-result ${testResult.success ? 'success' : 'error'}`}>
+                      {testResult.success ? '✓ Sent!' : `✗ ${testResult.error}`}
+                    </span>
+                  )}
+                </div>
+                {notificationHistory.length > 0 && (
+                  <div className="notification-history">
+                    <h4>Recent Notifications</h4>
+                    <ul className="notification-list">
+                      {notificationHistory.map((entry) => (
+                        <li key={entry.id} className={`notification-item ${entry.status}`}>
+                          <span className="notification-status">
+                            {entry.status === 'sent' ? '✓' : '✗'}
+                          </span>
+                          <span className="notification-summary">
+                            {entry.event_summary || entry.event_type || 'Unknown'}
+                          </span>
+                          <span className="notification-time">
+                            {formatDateTime(entry.created_at)}
+                          </span>
+                          {entry.error_message && (
+                            <span className="notification-error" title={entry.error_message}>
+                              Error
+                            </span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="not-configured">
+                Not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables.
+              </p>
+            )}
+          </div>
+
+          {/* Passkeys Section */}
           <div className="account-section">
             <h3>Passkeys</h3>
             {isLoading ? (
@@ -133,6 +225,16 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
                 Generate Invite Code
               </button>
             )}
+          </div>
+
+          <div className="account-section">
+            <h3>Appearance</h3>
+            <div className="theme-toggle">
+              <span>Theme</span>
+              <button className="theme-toggle-btn" onClick={onToggleTheme}>
+                {theme === 'dark' ? '🌙 Dark' : '☀️ Light'}
+              </button>
+            </div>
           </div>
 
           {error && <p className="account-error">{error}</p>}
