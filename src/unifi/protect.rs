@@ -157,7 +157,6 @@ pub async fn connect_protect_websocket(
                             }
                         }
 
-                        debug!("Protect event: {} | {}", event.event_type, event.summary);
                         if event_tx.send(event).await.is_err() {
                             warn!("Event channel closed, stopping Protect WebSocket");
                             break;

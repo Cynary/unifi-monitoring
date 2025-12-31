@@ -55,12 +55,15 @@ impl EventProcessor {
             .store_event(&event)
             .map_err(ProcessorError::Database)?;
 
-        debug!(
-            id = event.id,
-            event_type = event.event_type,
-            classification = classification.as_str(),
-            "Processed event"
-        );
+        // Skip logging for suppressed events
+        if classification != Classification::Suppressed {
+            debug!(
+                id = event.id,
+                event_type = event.event_type,
+                classification = classification.as_str(),
+                "Processed event"
+            );
+        }
 
         // If notify, queue for notification
         if classification == Classification::Notify {

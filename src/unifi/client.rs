@@ -135,10 +135,34 @@ impl UnifiClient {
         let db_clone = db.clone();
         let bootstrap_update_id = bootstrap_update_id.clone();
         handles.push(tokio::spawn(async move {
+            let mut rapid_disconnect_count = 0u32;
+
             loop {
                 // Query database for latest lastUpdateId on each reconnect
                 // This ensures we resume from where we actually left off, not startup position
-                let current_update_id = if let Some(ref db) = db_clone {
+                let current_update_id = if rapid_disconnect_count >= 3 {
+                    // Too many rapid disconnects - the saved ID is probably stale
+                    // Clear it and use fresh bootstrap
+                    warn!("Too many rapid disconnects, clearing saved lastUpdateId and using bootstrap");
+                    if let Some(ref db) = db_clone {
+                        if let Err(e) = db.clear_last_update_id("protect") {
+                            warn!(error = %e, "Failed to clear lastUpdateId");
+                        }
+                    }
+                    rapid_disconnect_count = 0;
+
+                    // Get fresh bootstrap
+                    match session_clone.get_protect_bootstrap().await {
+                        Ok(bootstrap) => {
+                            info!(update_id = %bootstrap.last_update_id, "Got fresh bootstrap lastUpdateId");
+                            bootstrap.last_update_id
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to get fresh bootstrap, using original");
+                            bootstrap_update_id.clone()
+                        }
+                    }
+                } else if let Some(ref db) = db_clone {
                     match db.get_last_update_id("protect") {
                         Ok(Some(saved_id)) => {
                             info!(saved_id = %saved_id, "Resuming Protect from saved lastUpdateId");
@@ -158,12 +182,29 @@ impl UnifiClient {
                 };
 
                 info!("Starting Protect WebSocket connection");
+                let start_time = std::time::Instant::now();
+
                 match connect_protect_websocket(&session_clone, &current_update_id, tx_clone.clone(), seen_clone.clone(), state_clone.clone(), db_clone.clone())
                     .await
                 {
                     Ok(_) => info!("Protect WebSocket disconnected normally"),
                     Err(e) => error!("Protect WebSocket error: {}", e),
                 }
+
+                // Check if connection was very short (< 5 seconds = likely invalid lastUpdateId)
+                let connection_duration = start_time.elapsed();
+                if connection_duration.as_secs() < 5 {
+                    rapid_disconnect_count += 1;
+                    warn!(
+                        duration_ms = connection_duration.as_millis(),
+                        rapid_count = rapid_disconnect_count,
+                        "Protect WebSocket disconnected rapidly, may have stale lastUpdateId"
+                    );
+                } else {
+                    // Connection lasted a reasonable time, reset counter
+                    rapid_disconnect_count = 0;
+                }
+
                 warn!("Protect WebSocket disconnected, reconnecting in 5s...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }

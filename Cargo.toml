@@ -53,6 +53,17 @@ axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+
+# WebAuthn / Passkey authentication
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+rand = "0.8"
+base64 = "0.22"
+bincode = "1"
+time = "0.3"
+
+# Rate limiting
+tower_governor = "0.6"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -104,7 +104,6 @@ pub async fn connect_system_websocket(
                             }
                             drop(seen);
 
-                            debug!("System event: {} | {}", event.event_type, event.summary);
                             if event_tx.send(event).await.is_err() {
                                 warn!("Event channel closed, stopping System WebSocket");
                                 break;

@@ -13,6 +13,7 @@ pub enum Classification {
     Ignored,
     Unclassified,
     Notify,
+    Suppressed,  // Not stored, not logged
 }
 
 impl Classification {
@@ -21,6 +22,7 @@ impl Classification {
             Classification::Ignored => "ignored",
             Classification::Unclassified => "unclassified",
             Classification::Notify => "notify",
+            Classification::Suppressed => "suppressed",
         }
     }
 
@@ -29,6 +31,7 @@ impl Classification {
             "ignored" => Some(Classification::Ignored),
             "unclassified" => Some(Classification::Unclassified),
             "notify" => Some(Classification::Notify),
+            "suppressed" => Some(Classification::Suppressed),
             _ => None,
         }
     }
@@ -118,6 +121,35 @@ impl Database {
                 last_update_id TEXT,
                 updated_at INTEGER NOT NULL
             );
+
+            -- Authentication: Passkey credentials
+            CREATE TABLE IF NOT EXISTS passkeys (
+                id TEXT PRIMARY KEY,
+                credential BLOB NOT NULL,
+                name TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            -- Authentication: Active sessions
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+            -- Authentication: Setup token (exists only when no passkeys registered)
+            CREATE TABLE IF NOT EXISTS setup_token (
+                token TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            );
+
+            -- Authentication: Invite tokens for adding passkeys
+            CREATE TABLE IF NOT EXISTS invite_tokens (
+                token TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
             "#,
         )?;
 
@@ -206,13 +238,24 @@ impl Database {
         rows.collect()
     }
 
+    /// Get classification for an event type without storing
+    pub fn get_classification(&self, event_type: &str) -> rusqlite::Result<Classification> {
+        Ok(self.get_rule(event_type)?.unwrap_or(Classification::Unclassified))
+    }
+
     /// Store an event, applying classification rules
     /// Returns the classification applied
+    /// Note: Suppressed events are NOT stored
     pub fn store_event(&self, event: &UnifiEvent) -> rusqlite::Result<Classification> {
         // First, look up the classification rule
         let classification = self
             .get_rule(&event.event_type)?
             .unwrap_or(Classification::Unclassified);
+
+        // Don't store suppressed events
+        if classification == Classification::Suppressed {
+            return Ok(classification);
+        }
 
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -293,6 +336,20 @@ impl Database {
         Ok(attempts)
     }
 
+    /// Get event payload by ID
+    pub fn get_event_payload(&self, event_id: &str) -> rusqlite::Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload FROM events WHERE id = ?1",
+            params![event_id],
+            |row| {
+                let payload_str: String = row.get(0)?;
+                Ok(serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null))
+            },
+        )
+        .optional()
+    }
+
     /// Get last update ID for a source (for WebSocket reconnection)
     pub fn get_last_update_id(&self, source: &str) -> rusqlite::Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
@@ -321,6 +378,17 @@ impl Database {
         )?;
 
         debug!(source, update_id, "Sync state updated");
+        Ok(())
+    }
+
+    /// Clear last update ID for a source (used when saved ID becomes invalid)
+    pub fn clear_last_update_id(&self, source: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE source = ?1",
+            params![source],
+        )?;
+        debug!(source, "Sync state cleared");
         Ok(())
     }
 
@@ -458,6 +526,99 @@ impl Database {
         rows.collect()
     }
 
+    /// Get the current database file size in bytes
+    pub fn get_size_bytes(&self) -> rusqlite::Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok(page_count * page_size)
+    }
+
+    /// Get the current database file size in MB
+    pub fn get_size_mb(&self) -> rusqlite::Result<f64> {
+        let bytes = self.get_size_bytes()?;
+        Ok(bytes as f64 / (1024.0 * 1024.0))
+    }
+
+    /// Get total event count
+    pub fn get_event_count(&self) -> rusqlite::Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+    }
+
+    /// Delete oldest events to bring database under size limit
+    /// Returns cleanup result with stats
+    pub fn cleanup_by_size(&self, max_size_mb: f64) -> rusqlite::Result<CleanupResult> {
+        let size_before_mb = self.get_size_mb()?;
+
+        if size_before_mb <= max_size_mb {
+            return Ok(CleanupResult {
+                deleted_events: 0,
+                size_before_mb,
+                size_after_mb: size_before_mb,
+            });
+        }
+
+        let event_count = self.get_event_count()?;
+        if event_count == 0 {
+            return Ok(CleanupResult {
+                deleted_events: 0,
+                size_before_mb,
+                size_after_mb: size_before_mb,
+            });
+        }
+
+        // Calculate how many events to delete based on size ratio
+        // Target 80% of max to leave headroom
+        let target_mb = max_size_mb * 0.8;
+        let reduction_ratio = (size_before_mb - target_mb) / size_before_mb;
+        let events_to_delete = ((event_count as f64) * reduction_ratio).ceil() as u64;
+
+        info!(
+            size_mb = size_before_mb,
+            max_mb = max_size_mb,
+            event_count,
+            events_to_delete,
+            "Database exceeds size limit, starting cleanup"
+        );
+
+        // Delete oldest events
+        let deleted = {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                r#"
+                DELETE FROM events WHERE id IN (
+                    SELECT id FROM events ORDER BY timestamp ASC LIMIT ?
+                )
+                "#,
+                params![events_to_delete],
+            )? as u64
+        };
+
+        debug!(deleted, "Deleted old events");
+
+        // Run VACUUM to reclaim space (this actually shrinks the file)
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute("VACUUM", [])?;
+        }
+
+        let size_after_mb = self.get_size_mb()?;
+
+        info!(
+            deleted,
+            size_before_mb,
+            size_after_mb,
+            "Database cleanup complete"
+        );
+
+        Ok(CleanupResult {
+            deleted_events: deleted,
+            size_before_mb,
+            size_after_mb,
+        })
+    }
+
     fn row_to_stored_event(row: &rusqlite::Row) -> rusqlite::Result<StoredEvent> {
         let source_str: String = row.get(1)?;
         let source = match source_str.as_str() {
@@ -497,6 +658,229 @@ impl Database {
             created_at: row.get(10)?,
         })
     }
+
+    // ==================== Authentication Methods ====================
+
+    /// Check if any passkeys are registered
+    pub fn has_any_passkeys(&self) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM passkeys", [], |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    /// Store a passkey credential
+    pub fn store_passkey(&self, id: &str, credential: &[u8], name: Option<&str>) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO passkeys (id, credential, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, credential, name, now],
+        )?;
+        debug!(id, "Passkey stored");
+        Ok(())
+    }
+
+    /// Get a passkey credential by ID
+    pub fn get_passkey(&self, id: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT credential FROM passkeys WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    /// Get all passkey credentials (for authentication)
+    pub fn get_all_passkeys(&self) -> rusqlite::Result<Vec<(String, Vec<u8>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, credential FROM passkeys")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// List passkeys with metadata (for UI)
+    pub fn list_passkeys(&self) -> rusqlite::Result<Vec<PasskeyInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, name, created_at FROM passkeys ORDER BY created_at")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PasskeyInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Delete a passkey by ID
+    pub fn delete_passkey(&self, id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute("DELETE FROM passkeys WHERE id = ?1", params![id])?;
+        Ok(rows > 0)
+    }
+
+    /// Create a new session and return its ID
+    pub fn create_session(&self, expiry_days: i64) -> rusqlite::Result<String> {
+        use rand::Rng;
+        let session_id: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(64)
+            .map(char::from)
+            .collect();
+
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + (expiry_days * 24 * 60 * 60);
+
+        conn.execute(
+            "INSERT INTO sessions (id, expires_at, created_at) VALUES (?1, ?2, ?3)",
+            params![session_id, expires_at, now],
+        )?;
+
+        debug!("Session created");
+        Ok(session_id)
+    }
+
+    /// Validate a session ID (returns true if valid and not expired)
+    pub fn validate_session(&self, session_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = ?1 AND expires_at > ?2",
+            params![session_id, now],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Delete a session
+    pub fn delete_session(&self, session_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        Ok(())
+    }
+
+    /// Delete all sessions (used when all passkeys are deleted)
+    pub fn delete_all_sessions(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sessions", [])?;
+        Ok(())
+    }
+
+    /// Clean up expired sessions
+    pub fn cleanup_expired_sessions(&self) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let rows = conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])?;
+        if rows > 0 {
+            debug!(count = rows, "Cleaned up expired sessions");
+        }
+        Ok(rows)
+    }
+
+    /// Get setup token (if exists)
+    pub fn get_setup_token(&self) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT token FROM setup_token LIMIT 1", [], |row| row.get(0))
+            .optional()
+    }
+
+    /// Set setup token (replaces any existing)
+    pub fn set_setup_token(&self, token: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute("DELETE FROM setup_token", [])?;
+        conn.execute(
+            "INSERT INTO setup_token (token, created_at) VALUES (?1, ?2)",
+            params![token, now],
+        )?;
+        Ok(())
+    }
+
+    /// Delete setup token
+    pub fn delete_setup_token(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM setup_token", [])?;
+        Ok(())
+    }
+
+    /// Validate setup token
+    pub fn validate_setup_token(&self, token: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM setup_token WHERE token = ?1",
+            params![token],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Create an invite token and return it
+    pub fn create_invite_token(&self, expiry_secs: i64) -> rusqlite::Result<String> {
+        use rand::Rng;
+        // Generate a human-readable token (words separated by dashes)
+        let words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot",
+                     "golf", "hotel", "india", "juliet", "kilo", "lima",
+                     "mike", "november", "oscar", "papa", "quebec", "romeo",
+                     "sierra", "tango", "uniform", "victor", "whiskey", "xray"];
+        let mut rng = rand::thread_rng();
+        let token: String = (0..4)
+            .map(|_| words[rng.gen_range(0..words.len())])
+            .collect::<Vec<_>>()
+            .join("-");
+
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + expiry_secs;
+
+        conn.execute(
+            "INSERT INTO invite_tokens (token, expires_at, created_at) VALUES (?1, ?2, ?3)",
+            params![token, expires_at, now],
+        )?;
+
+        debug!("Invite token created");
+        Ok(token)
+    }
+
+    /// Validate and consume an invite token (returns true if valid)
+    pub fn validate_invite_token(&self, token: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // Check if valid
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM invite_tokens WHERE token = ?1 AND expires_at > ?2",
+            params![token, now],
+            |row| row.get(0),
+        )?;
+
+        if count > 0 {
+            // Consume the token
+            conn.execute("DELETE FROM invite_tokens WHERE token = ?1", params![token])?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Clean up expired invite tokens
+    pub fn cleanup_expired_invite_tokens(&self) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let rows = conn.execute("DELETE FROM invite_tokens WHERE expires_at <= ?1", params![now])?;
+        Ok(rows)
+    }
+}
+
+/// Passkey info for UI display
+#[derive(Debug, Clone)]
+pub struct PasskeyInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub created_at: i64,
 }
 
 /// Summary of an event type for UI display
@@ -506,6 +890,14 @@ pub struct EventTypeSummary {
     pub count: i64,
     pub latest_timestamp: i64,
     pub classification: Classification,
+}
+
+/// Result of a cleanup operation
+#[derive(Debug)]
+pub struct CleanupResult {
+    pub deleted_events: u64,
+    pub size_before_mb: f64,
+    pub size_after_mb: f64,
 }
 
 #[cfg(test)]

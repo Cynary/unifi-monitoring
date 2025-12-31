@@ -1,8 +1,10 @@
 //! Web server module - Axum-based API and UI server
 
+pub mod auth;
+
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -10,19 +12,24 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use axum_extra::extract::CookieJar;
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tower_governor::{governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor, GovernorLayer};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::info;
+use tracing::{info, warn};
+use url::Url;
+use webauthn_rs::Webauthn;
 
 use crate::db::{Classification, Database};
+use auth::{AuthState, validate_session_from_cookies};
 
-/// Event sent via SSE to frontend
+/// Event sent via SSE to frontend (no payload - fetch separately)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SseEvent {
     pub id: String,
@@ -34,17 +41,24 @@ pub struct SseEvent {
     pub classification: String,
     pub notified: bool,
     pub created_at: i64,
-    pub payload: serde_json::Value,
 }
 
-/// Shared application state
+/// Shared application state (basic, for backwards compat)
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
     pub sse_tx: broadcast::Sender<SseEvent>,
 }
 
-/// Create the web server router
+/// Full application state with auth
+#[derive(Clone)]
+pub struct FullAppState {
+    pub db: Database,
+    pub sse_tx: broadcast::Sender<SseEvent>,
+    pub auth: AuthState,
+}
+
+/// Create the web server router (legacy - no auth)
 pub fn create_router(state: AppState, static_dir: Option<&str>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -53,18 +67,19 @@ pub fn create_router(state: AppState, static_dir: Option<&str>) -> Router {
 
     let api_router = Router::new()
         // Health check
-        .route("/api/health", get(health))
+        .route("/api/health", get(health_legacy))
         // Events API
-        .route("/api/events", get(list_events))
-        .route("/api/events/count", get(count_events))
-        .route("/api/events/types", get(list_event_types))
-        .route("/api/events/stream", get(event_stream))
+        .route("/api/events", get(list_events_legacy))
+        .route("/api/events/count", get(count_events_legacy))
+        .route("/api/events/types", get(list_event_types_legacy))
+        .route("/api/events/stream", get(event_stream_legacy))
+        .route("/api/events/{id}/payload", get(get_event_payload_legacy))
         // Rules API
-        .route("/api/rules", get(list_rules))
-        .route("/api/rules", post(set_rule))
-        .route("/api/rules/{event_type}", delete(delete_rule))
+        .route("/api/rules", get(list_rules_legacy))
+        .route("/api/rules", post(set_rule_legacy))
+        .route("/api/rules/{event_type}", delete(delete_rule_legacy))
         // Stats
-        .route("/api/stats", get(get_stats))
+        .route("/api/stats", get(get_stats_legacy))
         .layer(cors)
         .with_state(Arc::new(state));
 
@@ -77,7 +92,135 @@ pub fn create_router(state: AppState, static_dir: Option<&str>) -> Router {
     }
 }
 
-/// Start the web server
+/// Create WebAuthn instance from environment
+pub fn create_webauthn_from_env() -> Result<Webauthn, String> {
+    let rp_id = std::env::var("RP_ID").unwrap_or_else(|_| "localhost".to_string());
+    let rp_origin = std::env::var("RP_ORIGIN").unwrap_or_else(|_| "http://localhost:8080".to_string());
+
+    let origin_url = Url::parse(&rp_origin)
+        .map_err(|e| format!("Invalid RP_ORIGIN: {}", e))?;
+
+    auth::create_webauthn(&rp_id, &origin_url)
+        .map_err(|e| format!("Failed to create WebAuthn: {}", e))
+}
+
+/// Create CORS layer from environment
+fn create_cors_layer() -> CorsLayer {
+    let cors_origins = std::env::var("CORS_ORIGINS").ok();
+
+    if let Some(origins_str) = cors_origins {
+        // Parse comma-separated origins
+        let origins: Vec<_> = origins_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        if origins.is_empty() {
+            warn!("CORS_ORIGINS set but no valid origins parsed, falling back to RP_ORIGIN");
+        } else {
+            info!("CORS configured for origins: {:?}", origins_str);
+            return CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
+                .allow_credentials(true);
+        }
+    }
+
+    // Fall back to RP_ORIGIN if set
+    let rp_origin = std::env::var("RP_ORIGIN").ok();
+    if let Some(origin) = rp_origin {
+        if let Ok(parsed) = origin.parse() {
+            info!("CORS configured for RP_ORIGIN: {}", origin);
+            return CorsLayer::new()
+                .allow_origin([parsed])
+                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
+                .allow_credentials(true);
+        }
+    }
+
+    // Development fallback - allow any origin (only for localhost)
+    warn!("No CORS_ORIGINS or RP_ORIGIN set, allowing any origin (development mode)");
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+/// Create the web server router with authentication
+pub fn create_router_with_auth(state: FullAppState, static_dir: Option<&str>) -> Router {
+    let cors = create_cors_layer();
+
+    // Create rate limiter for auth endpoints (10 requests per second burst, 1 request/sec sustained)
+    // Using PeerIpKeyExtractor which works for both direct connections and behind proxies
+    let rate_limit_config = GovernorConfigBuilder::default()
+        .key_extractor(PeerIpKeyExtractor)
+        .per_second(1) // Base: 1 request per second
+        .burst_size(10) // Allow burst of 10 requests
+        .finish()
+        .unwrap();
+
+    let rate_limiter = GovernorLayer {
+        config: Arc::new(rate_limit_config),
+    };
+
+    let auth_state = Arc::new(state.auth.clone());
+    let full_state = Arc::new(state);
+
+    // Public auth routes (no auth required, rate limited)
+    let auth_routes = Router::new()
+        .route("/api/auth/status", get(auth::auth_status))
+        .route("/api/auth/register/start", post(auth::register_start))
+        .route("/api/auth/register/finish", post(auth::register_finish))
+        .route("/api/auth/login/start", post(auth::login_start))
+        .route("/api/auth/login/finish", post(auth::login_finish))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/passkeys", get(auth::list_passkeys))
+        .route("/api/auth/passkeys/{id}", delete(auth::delete_passkey))
+        .route("/api/auth/invite", post(auth::create_invite))
+        .layer(rate_limiter)
+        .with_state(auth_state);
+
+    // Protected routes (require valid session)
+    let protected_routes = Router::new()
+        // Events API
+        .route("/api/events", get(list_events))
+        .route("/api/events/count", get(count_events))
+        .route("/api/events/types", get(list_event_types))
+        .route("/api/events/stream", get(event_stream))
+        .route("/api/events/{id}/payload", get(get_event_payload))
+        // Rules API
+        .route("/api/rules", get(list_rules))
+        .route("/api/rules", post(set_rule))
+        .route("/api/rules/{event_type}", delete(delete_rule))
+        // Stats
+        .route("/api/stats", get(get_stats))
+        .with_state(full_state.clone());
+
+    // Public routes (no auth required)
+    let public_routes = Router::new()
+        .route("/api/health", get(health))
+        .with_state(full_state);
+
+    let api_router = Router::new()
+        .merge(auth_routes)
+        .merge(protected_routes)
+        .merge(public_routes)
+        .layer(cors);
+
+    // If static directory is provided, serve it as fallback
+    if let Some(dir) = static_dir {
+        let serve_dir = ServeDir::new(dir).fallback(ServeFile::new(format!("{}/index.html", dir)));
+        api_router.fallback_service(serve_dir)
+    } else {
+        api_router
+    }
+}
+
+/// Start the web server (legacy - no auth)
 pub async fn start_server(state: AppState, addr: &str, static_dir: Option<&str>) -> anyhow::Result<()> {
     let router = create_router(state, static_dir);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -86,11 +229,39 @@ pub async fn start_server(state: AppState, addr: &str, static_dir: Option<&str>)
     Ok(())
 }
 
+/// Start the web server with authentication
+pub async fn start_server_with_auth(state: FullAppState, addr: &str, static_dir: Option<&str>) -> anyhow::Result<()> {
+    let router = create_router_with_auth(state, static_dir);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("Web server listening on {} (auth enabled)", addr);
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+// ============================================================================
+// Auth helper
+// ============================================================================
+
+/// Check if request is authenticated, return error if not
+fn require_auth(jar: &CookieJar, db: &Database) -> Result<(), AppError> {
+    if validate_session_from_cookies(jar, db).is_some() {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized("Not authenticated".to_string()))
+    }
+}
+
 // ============================================================================
 // Health endpoint
 // ============================================================================
 
-async fn health() -> impl IntoResponse {
+async fn health(
+    State(_state): State<Arc<FullAppState>>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn health_legacy() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
@@ -99,6 +270,26 @@ async fn health() -> impl IntoResponse {
 // ============================================================================
 
 async fn event_stream(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    require_auth(&jar, &state.db)?;
+
+    let rx = state.sse_tx.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|result| {
+        match result {
+            Ok(sse_event) => {
+                let json = serde_json::to_string(&sse_event).unwrap_or_default();
+                Some(Ok(Event::default().event("event").data(json)))
+            }
+            Err(_) => None, // Skip lagged messages
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn event_stream_legacy(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.sse_tx.subscribe();
@@ -131,6 +322,8 @@ pub struct ListEventsQuery {
     limit: Option<usize>,
     /// Offset for pagination
     offset: Option<usize>,
+    /// Include payload in response (default false for list)
+    include_payload: Option<bool>,
 }
 
 impl ListEventsQuery {
@@ -164,18 +357,36 @@ pub struct EventResponse {
     pub classification: String,
     pub notified: bool,
     pub created_at: i64,
-    pub payload: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 async fn list_events(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+    Query(query): Query<ListEventsQuery>,
+) -> Result<Json<Vec<EventResponse>>, AppError> {
+    require_auth(&jar, &state.db)?;
+    list_events_impl(&state.db, query)
+}
+
+async fn list_events_legacy(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListEventsQuery>,
+) -> Result<Json<Vec<EventResponse>>, AppError> {
+    list_events_impl(&state.db, query)
+}
+
+fn list_events_impl(
+    db: &Database,
+    query: ListEventsQuery,
 ) -> Result<Json<Vec<EventResponse>>, AppError> {
     let classifications = query.classifications();
     let event_types = query.event_types();
     let event_type_refs: Vec<&str> = event_types.iter().map(|s| s.as_str()).collect();
+    let include_payload = query.include_payload.unwrap_or(false);
 
-    let events = state.db.query_events(
+    let events = db.query_events(
         &classifications,
         &event_type_refs,
         query.search.as_deref(),
@@ -195,7 +406,7 @@ async fn list_events(
             classification: e.classification.as_str().to_string(),
             notified: e.notified,
             created_at: e.created_at,
-            payload: e.payload,
+            payload: if include_payload { Some(e.payload) } else { None },
         })
         .collect();
 
@@ -208,14 +419,30 @@ pub struct CountResponse {
 }
 
 async fn count_events(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+    Query(query): Query<ListEventsQuery>,
+) -> Result<Json<CountResponse>, AppError> {
+    require_auth(&jar, &state.db)?;
+    count_events_impl(&state.db, query)
+}
+
+async fn count_events_legacy(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListEventsQuery>,
+) -> Result<Json<CountResponse>, AppError> {
+    count_events_impl(&state.db, query)
+}
+
+fn count_events_impl(
+    db: &Database,
+    query: ListEventsQuery,
 ) -> Result<Json<CountResponse>, AppError> {
     let classifications = query.classifications();
     let event_types = query.event_types();
     let event_type_refs: Vec<&str> = event_types.iter().map(|s| s.as_str()).collect();
 
-    let count = state.db.count_events(
+    let count = db.count_events(
         &classifications,
         &event_type_refs,
         query.search.as_deref(),
@@ -233,9 +460,21 @@ pub struct EventTypeResponse {
 }
 
 async fn list_event_types(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+) -> Result<Json<Vec<EventTypeResponse>>, AppError> {
+    require_auth(&jar, &state.db)?;
+    list_event_types_impl(&state.db)
+}
+
+async fn list_event_types_legacy(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<EventTypeResponse>>, AppError> {
-    let summaries = state.db.get_event_type_summary()?;
+    list_event_types_impl(&state.db)
+}
+
+fn list_event_types_impl(db: &Database) -> Result<Json<Vec<EventTypeResponse>>, AppError> {
+    let summaries = db.get_event_type_summary()?;
 
     let response: Vec<EventTypeResponse> = summaries
         .into_iter()
@@ -250,6 +489,34 @@ async fn list_event_types(
     Ok(Json(response))
 }
 
+#[derive(Debug, Serialize)]
+pub struct PayloadResponse {
+    pub payload: serde_json::Value,
+}
+
+async fn get_event_payload(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+    axum::extract::Path(event_id): axum::extract::Path<String>,
+) -> Result<Json<PayloadResponse>, AppError> {
+    require_auth(&jar, &state.db)?;
+    get_event_payload_impl(&state.db, &event_id)
+}
+
+async fn get_event_payload_legacy(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(event_id): axum::extract::Path<String>,
+) -> Result<Json<PayloadResponse>, AppError> {
+    get_event_payload_impl(&state.db, &event_id)
+}
+
+fn get_event_payload_impl(db: &Database, event_id: &str) -> Result<Json<PayloadResponse>, AppError> {
+    let payload = db.get_event_payload(event_id)?
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(PayloadResponse { payload }))
+}
+
 // ============================================================================
 // Rules API
 // ============================================================================
@@ -261,9 +528,21 @@ pub struct RuleResponse {
 }
 
 async fn list_rules(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+) -> Result<Json<Vec<RuleResponse>>, AppError> {
+    require_auth(&jar, &state.db)?;
+    list_rules_impl(&state.db)
+}
+
+async fn list_rules_legacy(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<RuleResponse>>, AppError> {
-    let rules = state.db.get_all_rules()?;
+    list_rules_impl(&state.db)
+}
+
+fn list_rules_impl(db: &Database) -> Result<Json<Vec<RuleResponse>>, AppError> {
+    let rules = db.get_all_rules()?;
 
     let response: Vec<RuleResponse> = rules
         .into_iter()
@@ -283,13 +562,26 @@ pub struct SetRuleRequest {
 }
 
 async fn set_rule(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+    Json(req): Json<SetRuleRequest>,
+) -> Result<Json<RuleResponse>, AppError> {
+    require_auth(&jar, &state.db)?;
+    set_rule_impl(&state.db, req)
+}
+
+async fn set_rule_legacy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetRuleRequest>,
 ) -> Result<Json<RuleResponse>, AppError> {
+    set_rule_impl(&state.db, req)
+}
+
+fn set_rule_impl(db: &Database, req: SetRuleRequest) -> Result<Json<RuleResponse>, AppError> {
     let classification = Classification::from_str(&req.classification)
         .ok_or_else(|| AppError::BadRequest("Invalid classification".to_string()))?;
 
-    state.db.set_rule(&req.event_type, classification)?;
+    db.set_rule(&req.event_type, classification)?;
 
     Ok(Json(RuleResponse {
         event_type: req.event_type,
@@ -298,10 +590,23 @@ async fn set_rule(
 }
 
 async fn delete_rule(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+    axum::extract::Path(event_type): axum::extract::Path<String>,
+) -> Result<StatusCode, AppError> {
+    require_auth(&jar, &state.db)?;
+    delete_rule_impl(&state.db, &event_type)
+}
+
+async fn delete_rule_legacy(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(event_type): axum::extract::Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let deleted = state.db.delete_rule(&event_type)?;
+    delete_rule_impl(&state.db, &event_type)
+}
+
+fn delete_rule_impl(db: &Database, event_type: &str) -> Result<StatusCode, AppError> {
+    let deleted = db.delete_rule(event_type)?;
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -322,9 +627,21 @@ pub struct StatsResponse {
 }
 
 async fn get_stats(
+    State(state): State<Arc<FullAppState>>,
+    jar: CookieJar,
+) -> Result<Json<StatsResponse>, AppError> {
+    require_auth(&jar, &state.db)?;
+    get_stats_impl(&state.db)
+}
+
+async fn get_stats_legacy(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<StatsResponse>, AppError> {
-    let summaries = state.db.get_event_type_summary()?;
+    get_stats_impl(&state.db)
+}
+
+fn get_stats_impl(db: &Database) -> Result<Json<StatsResponse>, AppError> {
+    let summaries = db.get_event_type_summary()?;
 
     let total_events: i64 = summaries.iter().map(|s| s.count).sum();
     let unclassified_types = summaries
@@ -357,11 +674,19 @@ pub enum AppError {
     Database(rusqlite::Error),
     BadRequest(String),
     NotFound,
+    Unauthorized(String),
+    Internal(String),
 }
 
 impl From<rusqlite::Error> for AppError {
     fn from(err: rusqlite::Error) -> Self {
         AppError::Database(err)
+    }
+}
+
+impl From<webauthn_rs::prelude::WebauthnError> for AppError {
+    fn from(err: webauthn_rs::prelude::WebauthnError) -> Self {
+        AppError::BadRequest(format!("WebAuthn error: {}", err))
     }
 }
 
@@ -374,6 +699,8 @@ impl IntoResponse for AppError {
             ),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
+            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
         (status, Json(serde_json::json!({ "error": message }))).into_response()

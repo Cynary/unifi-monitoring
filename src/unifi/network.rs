@@ -123,7 +123,6 @@ pub async fn connect_network_websocket(
                             }
                             drop(seen);
 
-                            debug!("Network event: {} | {}", event.event_type, event.summary);
                             if event_tx.send(event).await.is_err() {
                                 warn!("Event channel closed, stopping Network WebSocket");
                                 break;
