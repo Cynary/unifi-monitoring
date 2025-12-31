@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -9,20 +10,104 @@ use unifi_monitor::processor::{EventProcessor, NotificationSender, ProcessorConf
 use unifi_monitor::unifi::{UnifiClient, UnifiConfig};
 use unifi_monitor::web::{self, auth::AuthState, FullAppState, SseEvent, TelegramConfig};
 
+/// Clean up old log files to stay under size limit
+fn cleanup_logs(log_dir: &str, max_size_mb: u64) -> anyhow::Result<()> {
+    let max_size_bytes = max_size_mb * 1024 * 1024;
+    let log_path = Path::new(log_dir);
+
+    if !log_path.exists() {
+        return Ok(());
+    }
+
+    // Collect log files with their metadata
+    let mut files: Vec<(std::path::PathBuf, std::fs::Metadata)> = std::fs::read_dir(log_path)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.starts_with("unifi-monitor.log")
+        })
+        .filter_map(|entry| entry.metadata().ok().map(|meta| (entry.path(), meta)))
+        .collect();
+
+    // Sort by modification time (oldest first)
+    files.sort_by(|a, b| {
+        a.1.modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            .cmp(&b.1.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH))
+    });
+
+    // Calculate total size
+    let total_size: u64 = files.iter().map(|(_, meta)| meta.len()).sum();
+
+    if total_size <= max_size_bytes {
+        return Ok(());
+    }
+
+    // Delete oldest files until under limit
+    let mut current_size = total_size;
+    let mut deleted_count = 0;
+
+    for (path, meta) in files {
+        if current_size <= max_size_bytes {
+            break;
+        }
+
+        let file_size = meta.len();
+        if std::fs::remove_file(&path).is_ok() {
+            current_size -= file_size;
+            deleted_count += 1;
+            tracing::debug!("Deleted old log file: {}", path.display());
+        }
+    }
+
+    if deleted_count > 0 {
+        tracing::info!(
+            "Log cleanup: deleted {} files, size {:.1}MB -> {:.1}MB",
+            deleted_count,
+            total_size as f64 / 1024.0 / 1024.0,
+            current_size as f64 / 1024.0 / 1024.0
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
+    // Load .env file first (before logging setup to read LOG_DIR)
+    dotenvy::dotenv().ok();
+
+    // Log configuration
+    let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "data/logs".to_string());
+    let log_max_size_mb: u64 = std::env::var("LOG_MAX_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+
+    // Ensure log directory exists
+    std::fs::create_dir_all(&log_dir)?;
+
+    // Create file appender with daily rotation
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "unifi-monitor.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Initialize logging to file
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            "info,unifi_monitor=debug,tokio_tungstenite=info,tungstenite=info,hyper=info,reqwest=info",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| {
+                "info,unifi_monitor=debug,tokio_tungstenite=info,tungstenite=info,hyper=info,reqwest=info".to_string()
+            }),
         ))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
         .init();
 
     tracing::info!("UniFi Monitor starting...");
+    tracing::info!("Logging to {} (max {}MB)", log_dir, log_max_size_mb);
 
-    // Load .env file if present
-    dotenvy::dotenv().ok();
+    // Run log cleanup on startup
+    if let Err(e) = cleanup_logs(&log_dir, log_max_size_mb) {
+        tracing::warn!("Log cleanup on startup failed: {}", e);
+    }
 
     // UniFi configuration
     let host = std::env::var("UNIFI_HOST").expect("UNIFI_HOST required");
@@ -93,6 +178,19 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     tracing::warn!("Periodic cleanup failed: {}", e);
                 }
+            }
+        }
+    });
+
+    // Spawn periodic log cleanup task (every hour)
+    let log_dir_cleanup = log_dir.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        interval.tick().await; // Skip immediate tick
+        loop {
+            interval.tick().await;
+            if let Err(e) = cleanup_logs(&log_dir_cleanup, log_max_size_mb) {
+                tracing::warn!("Periodic log cleanup failed: {}", e);
             }
         }
     });

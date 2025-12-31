@@ -26,6 +26,8 @@ COPY --from=frontend /app/dist ./static/
 VOLUME /data
 ENV DATABASE_PATH=/data/unifi-monitor.db
 ENV SETUP_TOKEN_PATH=/data/setup-token.txt
+ENV LOG_DIR=/data/logs
+ENV LOG_MAX_SIZE_MB=512
 ENV STATIC_DIR=/app/static
 EXPOSE 8080
 CMD ["./unifi-monitor"]

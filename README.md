@@ -69,9 +69,11 @@ To receive notifications for events classified as "Notify":
 | `TELEGRAM_BOT_TOKEN` | No | - | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | No | - | Your Telegram chat ID |
 | `DATABASE_PATH` | No | `/data/unifi-monitor.db` | SQLite database path |
+| `DB_MAX_SIZE_MB` | No | `512` | Max database size before cleanup |
+| `LOG_DIR` | No | `/data/logs` | Directory for log files |
+| `LOG_MAX_SIZE_MB` | No | `512` | Max total log size before cleanup |
 | `SETUP_TOKEN_PATH` | No | `/data/setup-token.txt` | Initial setup token file |
 | `LISTEN_ADDR` | No | `0.0.0.0:8080` | HTTP listen address |
-| `DB_MAX_SIZE_MB` | No | `512` | Max database size before cleanup |
 | `INVITE_TOKEN_EXPIRY_SECS` | No | `300` | Passkey invite token expiry |
 | `SESSION_EXPIRY_DAYS` | No | `30` | Session duration |
 | `TELEGRAM_MAX_RETRIES` | No | `10` | Max notification retry attempts |

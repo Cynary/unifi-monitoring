@@ -9,7 +9,7 @@ Two options for deploying to TrueNAS Scale:
 2. Fill in:
    - **Application Name**: `unifi-monitor`
    - **Image Repository**: `ghcr.io/cynary/unifi-monitoring`
-   - **Image Tag**: `v0.1.0`
+   - **Image Tag**: `v0.1.1`
 
 3. Add **Environment Variables**:
    | Name | Value |

@@ -64,7 +64,7 @@ spec:
     spec:
       containers:
         - name: unifi-monitor
-          image: ghcr.io/cynary/unifi-monitoring:v0.1.0
+          image: ghcr.io/cynary/unifi-monitoring:v0.1.1
           ports:
             - containerPort: 8080
               name: http
@@ -76,6 +76,10 @@ spec:
               value: /data/unifi-monitor.db
             - name: SETUP_TOKEN_PATH
               value: /data/setup-token.txt
+            - name: LOG_DIR
+              value: /data/logs
+            - name: LOG_MAX_SIZE_MB
+              value: "512"
             - name: STATIC_DIR
               value: /app/static
           volumeMounts:
