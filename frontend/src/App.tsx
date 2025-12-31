@@ -92,8 +92,8 @@ function App() {
         setAuthStatus(status);
       } catch (err) {
         console.error('Failed to check auth status:', err);
-        // If we can't check auth, show login
-        setAuthStatus({ authenticated: false, has_passkeys: false, needs_setup: true });
+        // If we can't check auth, set error state (not needs_setup)
+        setAuthStatus({ authenticated: false, has_passkeys: true, needs_setup: false });
       } finally {
         setAuthLoading(false);
       }
