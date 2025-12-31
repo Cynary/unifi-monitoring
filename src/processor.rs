@@ -238,14 +238,15 @@ impl NotificationSender {
     }
 
     async fn try_send_telegram(&self, event: &StoredEvent) -> Result<(), TelegramError> {
+        let timestamp_str = chrono::DateTime::from_timestamp(event.timestamp, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "unknown time".to_string());
         let message = format!(
-            "🔔 *{}*\n\n{}\n\n_Source: {} | {}_",
+            "🔔 *{}*\n\n{}\n\n_Source: {} \\| {}_",
             escape_markdown(&event.event_type),
             escape_markdown(&event.summary),
-            event.source,
-            chrono::DateTime::from_timestamp(event.timestamp, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                .unwrap_or_else(|| "unknown time".to_string())
+            escape_markdown(&event.source.to_string()),
+            escape_markdown(&timestamp_str)
         );
 
         let url = format!(

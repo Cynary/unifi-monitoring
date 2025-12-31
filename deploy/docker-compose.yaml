@@ -1,0 +1,23 @@
+services:
+  unifi-monitor:
+    image: ghcr.io/cynary/unifi-monitoring:latest
+    container_name: unifi-monitor
+    restart: unless-stopped
+    ports:
+      - "30080:8080"
+    environment:
+      - UNIFI_HOST=${UNIFI_HOST}
+      - UNIFI_USERNAME=${UNIFI_USERNAME}
+      - UNIFI_PASSWORD=${UNIFI_PASSWORD}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - DATABASE_PATH=/data/unifi-monitor.db
+      - SETUP_TOKEN_PATH=/data/setup-token.txt
+      - LOG_DIR=/data/logs
+      - LOG_MAX_SIZE_MB=${LOG_MAX_SIZE_MB:-512}
+      - DB_MAX_SIZE_MB=${DB_MAX_SIZE_MB:-512}
+    volumes:
+      - unifi-monitor-data:/data
+
+volumes:
+  unifi-monitor-data:

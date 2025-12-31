@@ -33,3 +33,5 @@ Thumbs.db
 
 # Test fixtures (may contain sensitive data)
 tests/fixtures/
+my-deployment.yaml
+my-compose.yaml
