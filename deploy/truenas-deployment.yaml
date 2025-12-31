@@ -1,0 +1,121 @@
+# TrueNAS Scale Kubernetes Deployment
+#
+# Usage:
+# 1. Edit the Secret below with your credentials
+# 2. Edit the PersistentVolumeClaim hostPath to match your pool
+# 3. Apply: kubectl apply -f truenas-deployment.yaml
+#
+# Or use TrueNAS GUI: Apps > Discover Apps > Custom App
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unifi-monitor
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: unifi-monitor-secrets
+  namespace: unifi-monitor
+type: Opaque
+stringData:
+  # REQUIRED: Fill in your credentials
+  UNIFI_HOST: "192.168.1.1"
+  UNIFI_USERNAME: "your-username"
+  UNIFI_PASSWORD: "your-password"
+  # OPTIONAL: Telegram notifications
+  # TELEGRAM_BOT_TOKEN: "your-bot-token"
+  # TELEGRAM_CHAT_ID: "your-chat-id"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: unifi-monitor-data
+  namespace: unifi-monitor
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # For TrueNAS, you may want to use a specific storage class
+  # storageClassName: ix-storage-class-unifi-monitor
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unifi-monitor
+  namespace: unifi-monitor
+  labels:
+    app: unifi-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unifi-monitor
+  template:
+    metadata:
+      labels:
+        app: unifi-monitor
+    spec:
+      containers:
+        - name: unifi-monitor
+          image: ghcr.io/cynary/unifi-monitoring:v0.1.0
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - secretRef:
+                name: unifi-monitor-secrets
+          env:
+            - name: DATABASE_PATH
+              value: /data/unifi-monitor.db
+            - name: SETUP_TOKEN_PATH
+              value: /data/setup-token.txt
+            - name: STATIC_DIR
+              value: /app/static
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: unifi-monitor-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: unifi-monitor
+  namespace: unifi-monitor
+spec:
+  type: LoadBalancer
+  selector:
+    app: unifi-monitor
+  ports:
+    - port: 8080
+      targetPort: http
+      name: http

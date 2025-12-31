@@ -1,0 +1,37 @@
+# TrueNAS Scale Custom App Configuration
+# Use this with: Apps > Discover Apps > Custom App
+#
+# Or apply directly with kubectl:
+#   kubectl apply -f truenas-deployment.yaml
+
+# Application name
+name: unifi-monitor
+
+# Container image
+image:
+  repository: ghcr.io/cynary/unifi-monitoring
+  tag: v0.1.0
+  pullPolicy: IfNotPresent
+
+# Environment variables (REQUIRED - fill these in)
+env:
+  UNIFI_HOST: "192.168.1.1"          # Your UniFi console IP
+  UNIFI_USERNAME: "your-username"     # Local admin username
+  UNIFI_PASSWORD: "your-password"     # Local admin password
+  # Optional: Telegram notifications
+  # TELEGRAM_BOT_TOKEN: "your-bot-token"
+  # TELEGRAM_CHAT_ID: "your-chat-id"
+
+# Service configuration
+service:
+  type: LoadBalancer
+  port: 8080
+
+# Persistent storage for database
+persistence:
+  data:
+    enabled: true
+    mountPath: /data
+    size: 1Gi
+    # For TrueNAS, use a host path or PVC
+    # hostPath: /mnt/pool/apps/unifi-monitor
